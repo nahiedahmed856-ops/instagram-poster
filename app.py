@@ -5,7 +5,7 @@ import uuid
 import requests
 import threading
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 from instagrapi import Client
 
 app = Flask(__name__)
@@ -14,8 +14,191 @@ QUEUE_FILE = "queue.json"
 SESSION_FILE = "session.json"
 INTERVAL_HOURS = 3  # প্রতি ৩ ঘণ্টা পর পর পোস্ট হবে
 next_post_time = None
-last_post_log = "No posts yet."
+last_post_log = "Server started. Ready to schedule posts."
 is_posting = False
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Instagram 3-Hour Auto Poster Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; }
+        .badge-pending { background-color: #f59e0b; }
+        .badge-posted { background-color: #10b981; }
+        .badge-failed { background-color: #ef4444; }
+        .stat-card { text-align: center; padding: 18px; }
+        .stat-num { font-size: 2.2rem; font-weight: bold; }
+        .table-dark { --bs-table-bg: #1e293b; --bs-table-border-color: #334155; }
+        .btn-gradient { background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888); color: white; border: none; }
+        .btn-gradient:hover { color: white; opacity: 0.9; }
+    </style>
+</head>
+<body class="p-4">
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4 pb-2 border-bottom border-secondary">
+        <div>
+            <h2 class="fw-bold mb-0">📸 Instagram Auto-Poster</h2>
+            <p class="text-secondary mb-0">Scheduled Posting Every {{ interval_hours }} Hours (No API Required)</p>
+        </div>
+        <div>
+            <form action="/post_now" method="POST" onsubmit="return confirm('Do you want to post the next item right now?');">
+                <button type="submit" class="btn btn-danger fw-bold">⚡ Post Next Item Now</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Status & Stats Row -->
+    <div class="row g-3 mb-4">
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="text-secondary small">NEXT POST IN</div>
+                <div class="stat-num text-warning">{{ countdown }}</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="text-secondary small">PENDING QUEUE</div>
+                <div class="stat-num text-primary">{{ pending_count }}</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="text-secondary small">POSTED SO FAR</div>
+                <div class="stat-num text-success">{{ posted_count }}</div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="text-secondary small">FAILED POSTS</div>
+                <div class="stat-num text-danger">{{ failed_count }}</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- System Log Alert -->
+    <div class="alert alert-dark border-secondary d-flex align-items-center" role="alert">
+        <span class="badge bg-secondary me-2">Log</span>
+        <span>{{ last_log }}</span>
+    </div>
+
+    <div class="row g-4">
+        <!-- Add Single Post Form -->
+        <div class="col-md-6">
+            <div class="card p-3 h-100">
+                <h5 class="fw-bold text-info mb-3">➕ Add Single Post</h5>
+                <form action="/add" method="POST">
+                    <div class="mb-2">
+                        <label class="form-label small">Direct Image / Video URL (Google Drive / Cloudinary / Catbox):</label>
+                        <input type="url" name="media_url" class="form-control bg-dark text-white border-secondary" placeholder="https://..." required>
+                    </div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-8">
+                            <label class="form-label small">Title / Main Header:</label>
+                            <input type="text" name="title" class="form-control bg-dark text-white border-secondary" placeholder="Amazing sunset...">
+                        </div>
+                        <div class="col-4">
+                            <label class="form-label small">Media Type:</label>
+                            <select name="media_type" class="form-select bg-dark text-white border-secondary">
+                                <option value="photo">Photo</option>
+                                <option value="video">Video / Reel</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small">Caption Body:</label>
+                        <textarea name="caption" rows="2" class="form-control bg-dark text-white border-secondary" placeholder="Write your full caption here..."></textarea>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small">Hashtags:</label>
+                        <input type="text" name="hashtags" class="form-control bg-dark text-white border-secondary" placeholder="#viral #instagram #reels">
+                    </div>
+                    <button type="submit" class="btn btn-gradient w-100 fw-bold">Add to 3-Hour Queue</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Bulk Add Form for 1k items -->
+        <div class="col-md-6">
+            <div class="card p-3 h-100">
+                <h5 class="fw-bold text-success mb-3">📦 Bulk Upload (Up to 1,000 items)</h5>
+                <p class="text-secondary small mb-2">Paste 1 post per line in format:<br><code>Media_URL | Title | Caption | #Hashtags</code></p>
+                <form action="/bulk_add" method="POST">
+                    <div class="mb-3">
+                        <textarea name="bulk_data" rows="8" class="form-control bg-dark text-white border-secondary font-monospace" placeholder="https://catbox.moe/example1.jpg | Sunset in Bali | Vacation vibes | #travel #beach&#10;https://catbox.moe/example2.mp4 | Gym Workout | Monday motivation | #fitness #gym" required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-success w-100 fw-bold">Add All to Queue</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Posts Queue Table -->
+    <div class="card p-3 mt-4">
+        <h5 class="fw-bold mb-3">📋 Scheduled Queue (Total: {{ queue|length }})</h5>
+        <div class="table-responsive">
+            <table class="table table-dark table-hover align-middle">
+                <thead>
+                    <tr class="text-secondary">
+                        <th>#</th>
+                        <th>Type</th>
+                        <th>Title / Caption</th>
+                        <th>Media URL</th>
+                        <th>Status</th>
+                        <th>Time Info</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in queue %}
+                    <tr>
+                        <td>{{ loop.index }}</td>
+                        <td>
+                            {% if item.type == 'video' %}
+                            <span class="badge bg-danger">🎬 Reel/Video</span>
+                            {% else %}
+                            <span class="badge bg-primary">🖼️ Photo</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <strong>{{ item.title }}</strong><br>
+                            <small class="text-secondary">{{ item.caption[:50] }}... {{ item.hashtags }}</small>
+                        </td>
+                        <td>
+                            <a href="{{ item.media_url }}" target="_blank" class="text-info text-truncate d-inline-block" style="max-width: 200px;">{{ item.media_url }}</a>
+                        </td>
+                        <td>
+                            {% if item.status == 'Posted' %}
+                            <span class="badge badge-posted">✅ Posted</span>
+                            {% elif item.status == 'Pending' %}
+                            <span class="badge badge-pending">⏳ Pending</span>
+                            {% else %}
+                            <span class="badge badge-failed">❌ {{ item.error or 'Failed' }}</span>
+                            {% endif %}
+                        </td>
+                        <td class="small text-secondary">
+                            {% if item.posted_at %}
+                            Posted: {{ item.posted_at }}
+                            {% else %}
+                            Added: {{ item.added_at }}
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="text-center text-secondary py-4">No posts in queue. Add some above!</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+</body>
+</html>
+"""
 
 # Ensure queue file exists
 if not os.path.exists(QUEUE_FILE):
@@ -34,8 +217,7 @@ def save_queue(queue):
         json.dump(queue, f, indent=4, ensure_ascii=False)
 
 def download_file(url, output_path):
-    """Download image or video from cloud URL (Drive, Cloudinary, etc.)"""
-    # Handle Google Drive direct link conversion if applicable
+    """Download image or video from cloud URL"""
     if "drive.google.com" in url and "id=" in url:
         file_id = url.split("id=")[1].split("&")[0]
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -66,7 +248,7 @@ def get_instagram_client():
         cl.dump_settings(SESSION_FILE)
         return cl
     else:
-        raise Exception("No Instagram session or credentials found! Please run login_local.py first.")
+        raise Exception("No Instagram session or credentials found! Please upload session.json.")
 
 def post_next_item():
     global last_post_log, is_posting, next_post_time
@@ -88,21 +270,17 @@ def post_next_item():
         media_url = item.get("media_url")
         caption = f"{item.get('title', '')}\n\n{item.get('caption', '')}\n\n{item.get('hashtags', '')}".strip()
         
-        # Download media
-        ext = ".mp4" if item.get("type") == "video" or media_url.endswith((".mp4", ".mov", ".mkv")) else ".jpg"
+        ext = ".mp4" if item.get("type") == "video" or any(media_url.endswith(x) for x in [".mp4", ".mov", ".mkv"]) else ".jpg"
         temp_file = f"temp_{uuid.uuid4().hex}{ext}"
         download_file(media_url, temp_file)
 
-        # Connect to Instagram
         cl = get_instagram_client()
 
-        # Upload
         if ext == ".mp4":
             media = cl.clip_upload(temp_file, caption=caption)
         else:
             media = cl.photo_upload(temp_file, caption=caption)
 
-        # Mark as Posted
         for q in queue:
             if q["id"] == item["id"]:
                 q["status"] = "Posted"
@@ -130,7 +308,7 @@ def post_next_item():
 
 def scheduler_loop():
     global next_post_time
-    next_post_time = datetime.now() + timedelta(minutes=1)  # First check after 1 min
+    next_post_time = datetime.now() + timedelta(minutes=1)
     while True:
         try:
             if next_post_time and datetime.now() >= next_post_time:
@@ -139,7 +317,6 @@ def scheduler_loop():
             print(f"Scheduler error: {e}")
         time.sleep(30)
 
-# Start background thread
 scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
 scheduler_thread.start()
 
@@ -160,8 +337,8 @@ def index():
         else:
             countdown = "Posting right now..."
             
-    return render_template(
-        "index.html", 
+    return render_template_string(
+        HTML_TEMPLATE, 
         queue=queue, 
         pending_count=len(pending), 
         posted_count=len(posted),
@@ -196,12 +373,10 @@ def add_post():
 
 @app.route("/bulk_add", methods=["POST"])
 def bulk_add():
-    """Add multiple posts from bulk text (JSON or CSV format)"""
     bulk_text = request.form.get("bulk_data", "").strip()
     if bulk_text:
         queue = load_queue()
         try:
-            # Try JSON array first
             data = json.loads(bulk_text)
             for item in data:
                 queue.append({
@@ -215,7 +390,6 @@ def bulk_add():
                     "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 })
         except Exception:
-            # Parse line by line: MediaURL | Title | Caption | Hashtags
             for line in bulk_text.splitlines():
                 parts = [p.strip() for p in line.split("|")]
                 if parts and parts[0]:
