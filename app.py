@@ -5,12 +5,11 @@ import uuid
 import requests
 import threading
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, redirect, url_for, jsonify
+from flask import Flask, render_template_string, request, redirect, jsonify
 from instagrapi import Client
 
 app = Flask(__name__)
 
-# Determine reliable writable queue file location
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POSSIBLE_QUEUE_PATHS = [
     os.path.join(BASE_DIR, "queue.json"),
@@ -21,7 +20,7 @@ POSSIBLE_QUEUE_PATHS = [
 QUEUE_FILE = POSSIBLE_QUEUE_PATHS[0]
 SESSION_FILE = os.path.join(BASE_DIR, "session.json")
 
-INTERVAL_HOURS = 3  # প্রতি ৩ ঘণ্টা পর পর পোস্ট হবে
+INTERVAL_HOURS = 3
 next_post_time = None
 last_post_log = "Server started. Ready to schedule posts."
 is_posting = False
@@ -235,7 +234,6 @@ def get_writable_queue_path():
         try:
             if os.path.exists(p):
                 return p
-            # Test creating
             with open(p, "w", encoding="utf-8") as f:
                 json.dump([], f)
             return p
@@ -275,7 +273,14 @@ def download_file(url, output_path):
     with open(output_path, 'wb') as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
-    return output_path
+
+    # Detect file type by reading header bytes
+    with open(output_path, 'rb') as f:
+        header = f.read(16)
+    
+    # MP4 / MOV header magic bytes check
+    is_video = b'ftyp' in header or b'moov' in header or output_path.endswith((".mp4", ".mov", ".mkv"))
+    return is_video
 
 def get_instagram_client():
     cl = Client()
@@ -314,16 +319,30 @@ def post_next_item():
         media_url = item.get("media_url")
         caption = f"{item.get('title', '')}\n\n{item.get('caption', '')}\n\n{item.get('hashtags', '')}".strip()
         
-        ext = ".mp4" if item.get("type") == "video" or any(media_url.endswith(x) for x in [".mp4", ".mov", ".mkv"]) else ".jpg"
-        temp_file = os.path.join(BASE_DIR, f"temp_{uuid.uuid4().hex}{ext}")
-        download_file(media_url, temp_file)
+        # Download and auto-detect if video or photo
+        temp_file = os.path.join(BASE_DIR, f"temp_{uuid.uuid4().hex}.bin")
+        is_video = download_file(media_url, temp_file)
+
+        # Rename to correct extension
+        new_ext = ".mp4" if (is_video or item.get("type") == "video") else ".jpg"
+        actual_temp_file = temp_file + new_ext
+        os.rename(temp_file, actual_temp_file)
+        temp_file = actual_temp_file
 
         cl = get_instagram_client()
 
-        if ext == ".mp4":
-            media = cl.clip_upload(temp_file, caption=caption)
+        # Auto upload video or photo based on actual file content
+        if new_ext == ".mp4":
+            try:
+                media = cl.clip_upload(temp_file, caption=caption)
+            except Exception:
+                media = cl.video_upload(temp_file, caption=caption)
         else:
-            media = cl.photo_upload(temp_file, caption=caption)
+            try:
+                media = cl.photo_upload(temp_file, caption=caption)
+            except Exception:
+                # Fallback to video upload if image upload fails due to video header
+                media = cl.clip_upload(temp_file, caption=caption)
 
         for q in queue:
             if q["id"] == item["id"]:
@@ -420,7 +439,7 @@ def add_post():
                 save_queue(queue)
         except Exception as e:
             print(f"Error in add_post: {e}")
-    return redirect(url_for("index"))
+    return redirect("/")
 
 @app.route("/bulk_add", methods=["GET", "POST"])
 def bulk_add():
@@ -464,7 +483,7 @@ def bulk_add():
                 save_queue(queue)
         except Exception as e:
             print(f"Error in bulk_add: {e}")
-    return redirect(url_for("index"))
+    return redirect("/")
 
 @app.route("/post_now", methods=["GET", "POST"])
 def trigger_post_now():
@@ -472,7 +491,7 @@ def trigger_post_now():
         threading.Thread(target=post_next_item).start()
     except Exception as e:
         print(f"Error triggering post_now: {e}")
-    return redirect(url_for("index"))
+    return redirect("/")
 
 @app.route("/ping", methods=["GET"])
 def ping():
