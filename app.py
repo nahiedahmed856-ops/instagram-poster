@@ -10,8 +10,17 @@ from instagrapi import Client
 
 app = Flask(__name__)
 
-QUEUE_FILE = "queue.json"
-SESSION_FILE = "session.json"
+# Determine reliable writable queue file location
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+POSSIBLE_QUEUE_PATHS = [
+    os.path.join(BASE_DIR, "queue.json"),
+    os.path.join(os.getcwd(), "queue.json"),
+    "/tmp/queue.json"
+]
+
+QUEUE_FILE = POSSIBLE_QUEUE_PATHS[0]
+SESSION_FILE = os.path.join(BASE_DIR, "session.json")
+
 INTERVAL_HOURS = 3  # প্রতি ৩ ঘণ্টা পর পর পোস্ট হবে
 next_post_time = None
 last_post_log = "Server started. Ready to schedule posts."
@@ -56,7 +65,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="col-md-3">
             <div class="card stat-card">
                 <div class="text-secondary small">NEXT POST IN</div>
-                <div class="stat-num text-warning">{{ countdown }}</div>
+                <div class="stat-num text-warning" id="timer-box">{{ countdown }}</div>
             </div>
         </div>
         <div class="col-md-3">
@@ -196,28 +205,63 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 </div>
+
+<script>
+    let totalSeconds = {{ remaining_seconds }};
+    const timerBox = document.getElementById("timer-box");
+
+    if (totalSeconds > 0) {
+        setInterval(() => {
+            if (totalSeconds <= 0) {
+                location.reload();
+            } else {
+                totalSeconds--;
+                let hours = Math.floor(totalSeconds / 3600);
+                let minutes = Math.floor((totalSeconds % 3600) / 60);
+                let seconds = totalSeconds % 60;
+                timerBox.innerText = `${hours}h ${minutes}m ${seconds}s`;
+            }
+        }, 1000);
+    } else {
+        setTimeout(() => { location.reload(); }, 15000);
+    }
+</script>
 </body>
 </html>
 """
 
-# Ensure queue file exists
-if not os.path.exists(QUEUE_FILE):
-    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-        json.dump([], f, indent=4)
+def get_writable_queue_path():
+    for p in POSSIBLE_QUEUE_PATHS:
+        try:
+            if os.path.exists(p):
+                return p
+            # Test creating
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            return p
+        except Exception:
+            continue
+    return POSSIBLE_QUEUE_PATHS[0]
 
 def load_queue():
+    path = get_writable_queue_path()
     try:
-        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception:
-        return []
+        pass
+    return []
 
 def save_queue(queue):
-    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-        json.dump(queue, f, indent=4, ensure_ascii=False)
+    path = get_writable_queue_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(queue, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error saving queue to {path}: {e}")
 
 def download_file(url, output_path):
-    """Download image or video from cloud URL"""
     if "drive.google.com" in url and "id=" in url:
         file_id = url.split("id=")[1].split("&")[0]
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -271,7 +315,7 @@ def post_next_item():
         caption = f"{item.get('title', '')}\n\n{item.get('caption', '')}\n\n{item.get('hashtags', '')}".strip()
         
         ext = ".mp4" if item.get("type") == "video" or any(media_url.endswith(x) for x in [".mp4", ".mov", ".mkv"]) else ".jpg"
-        temp_file = f"temp_{uuid.uuid4().hex}{ext}"
+        temp_file = os.path.join(BASE_DIR, f"temp_{uuid.uuid4().hex}{ext}")
         download_file(media_url, temp_file)
 
         cl = get_instagram_client()
@@ -320,7 +364,7 @@ def scheduler_loop():
 scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
 scheduler_thread.start()
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
     queue = load_queue()
     pending = [q for q in queue if q.get("status") == "Pending"]
@@ -328,10 +372,12 @@ def index():
     failed = [q for q in queue if q.get("status") == "Failed"]
     
     countdown = "Calculating..."
+    remaining_seconds = 0
     if next_post_time:
         diff = next_post_time - datetime.now()
         if diff.total_seconds() > 0:
-            hours, remainder = divmod(int(diff.total_seconds()), 3600)
+            remaining_seconds = int(diff.total_seconds())
+            hours, remainder = divmod(remaining_seconds, 3600)
             mins, secs = divmod(remainder, 60)
             countdown = f"{hours}h {mins}m {secs}s"
         else:
@@ -344,79 +390,91 @@ def index():
         posted_count=len(posted),
         failed_count=len(failed),
         countdown=countdown,
+        remaining_seconds=remaining_seconds,
         last_log=last_post_log,
         interval_hours=INTERVAL_HOURS
     )
 
-@app.route("/add", methods=["POST"])
+@app.route("/add", methods=["GET", "POST"])
 def add_post():
-    title = request.form.get("title", "")
-    caption = request.form.get("caption", "")
-    hashtags = request.form.get("hashtags", "")
-    media_url = request.form.get("media_url", "").strip()
-    media_type = request.form.get("media_type", "photo")
-
-    if media_url:
-        queue = load_queue()
-        queue.append({
-            "id": str(uuid.uuid4()),
-            "title": title,
-            "caption": caption,
-            "hashtags": hashtags,
-            "media_url": media_url,
-            "type": media_type,
-            "status": "Pending",
-            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        save_queue(queue)
-    return redirect(url_for("index"))
-
-@app.route("/bulk_add", methods=["POST"])
-def bulk_add():
-    bulk_text = request.form.get("bulk_data", "").strip()
-    if bulk_text:
-        queue = load_queue()
+    if request.method == "POST":
         try:
-            data = json.loads(bulk_text)
-            for item in data:
+            title = request.form.get("title", "")
+            caption = request.form.get("caption", "")
+            hashtags = request.form.get("hashtags", "")
+            media_url = request.form.get("media_url", "").strip()
+            media_type = request.form.get("media_type", "photo")
+
+            if media_url:
+                queue = load_queue()
                 queue.append({
                     "id": str(uuid.uuid4()),
-                    "title": item.get("title", "No Title"),
-                    "caption": item.get("caption", ""),
-                    "hashtags": item.get("hashtags", ""),
-                    "media_url": item.get("media_url", ""),
-                    "type": item.get("type", "photo"),
+                    "title": title,
+                    "caption": caption,
+                    "hashtags": hashtags,
+                    "media_url": media_url,
+                    "type": media_type,
                     "status": "Pending",
                     "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 })
-        except Exception:
-            for line in bulk_text.splitlines():
-                parts = [p.strip() for p in line.split("|")]
-                if parts and parts[0]:
-                    media_url = parts[0]
-                    title = parts[1] if len(parts) > 1 else "Auto Post"
-                    caption = parts[2] if len(parts) > 2 else ""
-                    hashtags = parts[3] if len(parts) > 3 else ""
-                    media_type = "video" if any(media_url.endswith(x) for x in [".mp4", ".mov", ".mkv"]) else "photo"
-                    queue.append({
-                        "id": str(uuid.uuid4()),
-                        "title": title,
-                        "caption": caption,
-                        "hashtags": hashtags,
-                        "media_url": media_url,
-                        "type": media_type,
-                        "status": "Pending",
-                        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-        save_queue(queue)
+                save_queue(queue)
+        except Exception as e:
+            print(f"Error in add_post: {e}")
     return redirect(url_for("index"))
 
-@app.route("/post_now", methods=["POST"])
+@app.route("/bulk_add", methods=["GET", "POST"])
+def bulk_add():
+    if request.method == "POST":
+        try:
+            bulk_text = request.form.get("bulk_data", "").strip()
+            if bulk_text:
+                queue = load_queue()
+                try:
+                    data = json.loads(bulk_text)
+                    for item in data:
+                        queue.append({
+                            "id": str(uuid.uuid4()),
+                            "title": item.get("title", "No Title"),
+                            "caption": item.get("caption", ""),
+                            "hashtags": item.get("hashtags", ""),
+                            "media_url": item.get("media_url", ""),
+                            "type": item.get("type", "photo"),
+                            "status": "Pending",
+                            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                except Exception:
+                    for line in bulk_text.splitlines():
+                        parts = [p.strip() for p in line.split("|")]
+                        if parts and parts[0]:
+                            media_url = parts[0]
+                            title = parts[1] if len(parts) > 1 else "Auto Post"
+                            caption = parts[2] if len(parts) > 2 else ""
+                            hashtags = parts[3] if len(parts) > 3 else ""
+                            media_type = "video" if any(media_url.endswith(x) for x in [".mp4", ".mov", ".mkv"]) else "photo"
+                            queue.append({
+                                "id": str(uuid.uuid4()),
+                                "title": title,
+                                "caption": caption,
+                                "hashtags": hashtags,
+                                "media_url": media_url,
+                                "type": media_type,
+                                "status": "Pending",
+                                "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                save_queue(queue)
+        except Exception as e:
+            print(f"Error in bulk_add: {e}")
+    return redirect(url_for("index"))
+
+@app.route("/post_now", methods=["GET", "POST"])
 def trigger_post_now():
-    threading.Thread(target=post_next_item).start()
+    try:
+        threading.Thread(target=post_next_item).start()
+    except Exception as e:
+        print(f"Error triggering post_now: {e}")
     return redirect(url_for("index"))
 
-@app.route("/ping")
+@app.route("/ping", methods=["GET"])
 def ping():
     return jsonify({"status": "alive", "time": datetime.now().isoformat()})
 
